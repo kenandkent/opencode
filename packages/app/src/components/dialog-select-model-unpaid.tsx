@@ -57,6 +57,7 @@ export const DialogSelectModelUnpaid: Component<{ model?: ModelState }> = (props
               class="w-full"
               placement="right-start"
               gutter={12}
+              delay="intent"
               value={
                 <ModelTooltip
                   model={item}
