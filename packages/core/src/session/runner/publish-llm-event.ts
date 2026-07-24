@@ -23,8 +23,29 @@ type Input = {
   readonly assistantMessageID: SessionMessage.ID
 }
 
-const record = (value: unknown): Record<string, unknown> =>
+const asRecord = (value: unknown): Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : { value }
+
+/** Immutable fold of the durable facts a step's writer has recorded so far. */
+export interface StepRecord {
+  /** The model produced visible output this attempt, which bars transparent retries and overflow recovery. */
+  readonly outputStarted: boolean
+  readonly providerFailed: boolean
+  /** The step's recorded assistant failure, if any. */
+  readonly failure?: SessionError.Error
+  /** Present once the provider finished the step normally. */
+  readonly finish?: {
+    readonly finish: Extract<LLMEvent, { type: "step-finish" }>["reason"]["normalized"]
+    readonly tokens: ReturnType<typeof SessionUsage.tokens>
+  }
+  readonly calls: ReadonlyArray<{
+    readonly id: string
+    readonly name: string
+    readonly called: boolean
+    readonly settled: boolean
+    readonly providerExecuted: boolean
+  }>
+}
 
 /** Derives canonical model content from a provider-hosted tool result. */
 const hostedContent = (result: ToolResultValue): Tool.NonEmptyContent => {
@@ -54,14 +75,9 @@ export const createLLMEventPublisher = (events: Pick<EventV2.Interface, "publish
   let stepStarted = false
   let stepFailed = false
   let providerFailed = false
-  let retryEvidence = false
+  let outputStarted = false
   let stepFailure: SessionError.Error | undefined
-  let stepSettlement:
-    | {
-        readonly finish: Extract<LLMEvent, { type: "step-finish" }>["reason"]["normalized"]
-        readonly tokens: ReturnType<typeof SessionUsage.tokens>
-      }
-    | undefined
+  let stepSettlement: StepRecord["finish"]
 
   const startAssistant = Effect.fnUntraced(function* () {
     if (stepStarted) return assistantMessageID
@@ -299,7 +315,7 @@ export const createLLMEventPublisher = (events: Pick<EventV2.Interface, "publish
         yield* startAssistant()
         return
       case "text-start":
-        retryEvidence = true
+        outputStarted = true
         const startedTextOrdinal = yield* text.start(event.id)
         yield* events.publish(SessionEvent.Text.Started, {
           sessionID: input.sessionID,
@@ -320,7 +336,7 @@ export const createLLMEventPublisher = (events: Pick<EventV2.Interface, "publish
         yield* text.end(event.id)
         return
       case "reasoning-start":
-        retryEvidence = true
+        outputStarted = true
         const startedReasoningOrdinal = yield* reasoning.start(event.id, providerState(event.providerMetadata))
         yield* events.publish(SessionEvent.Reasoning.Started, {
           sessionID: input.sessionID,
@@ -346,7 +362,7 @@ export const createLLMEventPublisher = (events: Pick<EventV2.Interface, "publish
         yield* reasoning.end(event.id, providerState(event.providerMetadata))
         return
       case "tool-input-start":
-        retryEvidence = true
+        outputStarted = true
         yield* startToolInput(event)
         return
       case "tool-input-delta": {
@@ -368,11 +384,11 @@ export const createLLMEventPublisher = (events: Pick<EventV2.Interface, "publish
         yield* endToolInput(event)
         return
       case "tool-input-error":
-        retryEvidence = true
+        outputStarted = true
         yield* failMalformedToolInput(event)
         return
       case "tool-call": {
-        retryEvidence = true
+        outputStarted = true
         if (!tools.has(event.id)) yield* startToolInput(event)
         const tool = tools.get(event.id)!
         if (toolInput.has(event.id)) yield* endToolInput(event)
@@ -385,7 +401,7 @@ export const createLLMEventPublisher = (events: Pick<EventV2.Interface, "publish
           sessionID: input.sessionID,
           assistantMessageID: tool.assistantMessageID,
           callID: event.id,
-          input: record(event.input),
+          input: asRecord(event.input),
           executed: tool.providerExecuted,
           state: providerState(event.providerMetadata),
         })
@@ -535,9 +551,20 @@ export const createLLMEventPublisher = (events: Pick<EventV2.Interface, "publish
     publishStepFailure,
     failUnsettledTools,
     hasProviderError: () => providerFailed,
-    hasRetryEvidence: () => retryEvidence,
-    stepFailure: () => stepFailure,
-    stepSettlement: () => stepSettlement,
+    /** Immutable snapshot of everything recorded for this step so far. */
+    record: (): StepRecord => ({
+      outputStarted,
+      providerFailed,
+      failure: stepFailure,
+      finish: stepSettlement,
+      calls: Array.from(tools, ([id, tool]) => ({
+        id,
+        name: tool.name,
+        called: tool.called,
+        settled: tool.settled,
+        providerExecuted: tool.providerExecuted,
+      })),
+    }),
     startAssistant,
     assistantMessageID: assistantMessageIDForTool,
   }
